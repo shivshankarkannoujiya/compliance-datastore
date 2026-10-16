@@ -14,11 +14,25 @@ module.exports = {
       to: { dependencyTypes: ['npm', 'npm-dev', 'npm-peer', 'npm-optional', 'core'] },
     },
     {
-      name: 'pure-domain-no-nest-layer',
+      name: 'pure-domain-stays-pure',
       severity: 'error',
-      comment: 'Rules and scoring must not depend on the Nest module that wraps them.',
+      comment: 'Rules and scoring may only import each other and shared helpers, never the Nest or storage modules.',
       from: { path: PURE },
-      to: { path: '^src/compliance-scoring/' },
+      to: { path: '^src/', pathNot: PURE },
+    },
+    {
+      name: 'storage-modules-do-not-depend-on-publishing',
+      severity: 'error',
+      comment: 'Publishing reads the other modules through their services; they never call back into it.',
+      from: { path: '^src/(subjects|catalogue|requirements|evidence)/' },
+      to: { path: '^src/publishing/' },
+    },
+    {
+      name: 'storage-modules-independent',
+      severity: 'error',
+      comment: 'Subjects, catalogue, requirements and evidence each own their tables and do not import each other.',
+      from: { path: '^src/(subjects|catalogue|requirements|evidence)/' },
+      to: { path: '^src/(subjects|catalogue|requirements|evidence)/', pathNot: '^src/$1/' },
     },
     {
       name: 'rules-do-not-depend-on-scoring',

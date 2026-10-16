@@ -1,0 +1,278 @@
+// Compliance data store schema. One owning module per table group:
+//   subjects      → Subject, SubjectAlias
+//   catalogue     → ComplianceType, ComplianceTypeVersion
+//   requirements  → Requirement
+//   evidence      → ComplianceRecord              (append-only, enforced by a trigger)
+//   publishing    → PublishRun, Published*         (frozen snapshots read by Power BI views)
+// Other modules read and write these tables only through the owning module's exported service.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SubjectKind {
+  PERSON
+  SITE
+  ORGANISATION
+}
+
+/// A person, site or the organisation whose compliance is tracked. Replaces the Names tab and its name-text key.
+model Subject {
+  id          String      @id @default(uuid()) @db.Uuid
+  kind        SubjectKind
+  displayName String      @map("display_name")
+  /// Identifier in the source system (ESR number, site code…), when there is one.
+  externalRef String?     @unique @map("external_ref")
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  aliases      SubjectAlias[]
+  requirements Requirement[]
+  records      ComplianceRecord[]
+
+  @@map("subject")
+}
+
+/// Name spellings used by the legacy tools and source exports, so imports resolve to one subject.
+model SubjectAlias {
+  id         String   @id @default(uuid()) @db.Uuid
+  subjectId  String   @map("subject_id") @db.Uuid
+  alias      String
+  /// Lower-cased, trimmed, single-spaced alias; unique so a name can never point at two subjects.
+  normalised String   @unique
+  source     String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+
+  @@index([subjectId])
+  @@map("subject_alias")
+}
+
+/// A compliance type (DBS, Fire Safety Training, Moderate Harm…). Its rules live in versions.
+model ComplianceType {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  /// Lower-cased, trimmed name; unique.
+  code      String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  versions     ComplianceTypeVersion[]
+  requirements Requirement[]
+  records      ComplianceRecord[]
+
+  @@map("compliance_type")
+}
+
+/// The catalogue entry for a type over a period. A change creates a new version and closes the previous one, so
+/// any past as-of date scores with the settings that applied then. One open version per type (partial unique index).
+model ComplianceTypeVersion {
+  id               String    @id @default(uuid()) @db.Uuid
+  complianceTypeId String    @map("compliance_type_id") @db.Uuid
+  version          Int
+  validFrom        DateTime  @map("valid_from") @db.Date
+  /// Exclusive end; null while current.
+  validTo          DateTime? @map("valid_to") @db.Date
+  /// Compliance Group – Level 1 and Level 2 (Level 2 selects the compliance rule).
+  groupLevel1      String    @map("group_level_1")
+  groupLevel2      String    @map("group_level_2")
+  /// Compliance Group 1 / 2 (Requirements table hierarchy).
+  group            String
+  subGroup         String    @map("sub_group")
+  /// Compliance Group 3 / 4 (Requirements_Detailed hierarchy), when the type appears there.
+  detailedGroup    String?   @map("detailed_group")
+  detailedSubGroup String?   @map("detailed_sub_group")
+  core             Boolean
+  /// Months between renewals; null means it never expires (the workbook's 10000 sentinel).
+  timeframeMonths  Int?      @map("timeframe_months")
+  threshold1       Decimal   @map("threshold_1") @db.Decimal(6, 5)
+  threshold2       Decimal   @map("threshold_2") @db.Decimal(6, 5)
+  threshold3       Decimal   @map("threshold_3") @db.Decimal(6, 5)
+  threshold4       Decimal   @map("threshold_4") @db.Decimal(6, 5)
+  threshold5       Decimal   @map("threshold_5") @db.Decimal(6, 5)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdBy        String    @map("created_by")
+
+  complianceType ComplianceType @relation(fields: [complianceTypeId], references: [id], onDelete: Restrict)
+
+  @@unique([complianceTypeId, version])
+  @@index([validFrom, validTo])
+  @@map("compliance_type_version")
+}
+
+/// A subject must hold a compliance type over a period. Replaces the Requirements tabs and the Active flag.
+model Requirement {
+  id               String    @id @default(uuid()) @db.Uuid
+  subjectId        String    @map("subject_id") @db.Uuid
+  complianceTypeId String    @map("compliance_type_id") @db.Uuid
+  /// "Required (T/F)": false keeps the row for reference but it never counts toward percentages.
+  required         Boolean   @default(true)
+  activeFrom       DateTime  @map("active_from") @db.Date
+  /// Exclusive end; null while active.
+  activeTo         DateTime? @map("active_to") @db.Date
+  notes            String?
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdBy        String    @map("created_by")
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  subject        Subject        @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  complianceType ComplianceType @relation(fields: [complianceTypeId], references: [id], onDelete: Restrict)
+
+  @@unique([subjectId, complianceTypeId, activeFrom])
+  @@index([complianceTypeId])
+  @@map("requirement")
+}
+
+enum RecordSource {
+  MANUAL
+  IMPORT
+  MIGRATION
+}
+
+/// One completion record. Rows are never updated or deleted, except to void them once; a correction is a new row
+/// that supersedes the voided one. A database trigger enforces this. Replaces the Compliance Data table.
+model ComplianceRecord {
+  id               String       @id @default(uuid()) @db.Uuid
+  /// Entry order; breaks ties between records with the same completion date.
+  recordedSeq      Int          @default(autoincrement()) @map("recorded_seq")
+  subjectId        String       @map("subject_id") @db.Uuid
+  complianceTypeId String       @map("compliance_type_id") @db.Uuid
+  completionDate   DateTime?    @map("completion_date") @db.Date
+  completionStatus String?      @map("completion_status")
+  dueDate          DateTime?    @map("due_date") @db.Date
+  issue            Int?
+  notes            String?
+  source           RecordSource
+  /// Import batch, legacy row reference or form submission id.
+  sourceRef        String?      @map("source_ref")
+  recordedAt       DateTime     @default(now()) @map("recorded_at") @db.Timestamptz(3)
+  recordedBy       String       @map("recorded_by")
+  supersedesId     String?      @unique @map("supersedes_id") @db.Uuid
+  voidedAt         DateTime?    @map("voided_at") @db.Timestamptz(3)
+  voidedBy         String?      @map("voided_by")
+  voidReason       String?      @map("void_reason")
+
+  subject        Subject           @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  complianceType ComplianceType    @relation(fields: [complianceTypeId], references: [id], onDelete: Restrict)
+  supersedes     ComplianceRecord? @relation("Correction", fields: [supersedesId], references: [id], onDelete: Restrict)
+  supersededBy   ComplianceRecord? @relation("Correction")
+
+  @@unique([recordedSeq])
+  @@index([subjectId, complianceTypeId])
+  @@index([voidedAt])
+  @@map("compliance_record")
+}
+
+enum PublishStatus {
+  DRAFT
+  PUBLISHED
+  DISCARDED
+}
+
+enum Hierarchy {
+  /// Compliance Group 1 / 2 (Requirements).
+  PRIMARY
+  /// Compliance Group 3 / 4 (Requirements_Detailed).
+  DETAILED
+}
+
+/// One calculation of every score as of a date. A draft is reviewed and approved by a second person before it is
+/// published; Power BI reads only the latest published run. Replaces Last Updated and "refresh twice".
+model PublishRun {
+  id            String        @id @default(uuid()) @db.Uuid
+  asOf          DateTime      @map("as_of") @db.Date
+  policyVersion String        @map("policy_version")
+  status        PublishStatus @default(DRAFT)
+  warnings      Json          @default("[]")
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdBy     String        @map("created_by")
+  decidedAt     DateTime?     @map("decided_at") @db.Timestamptz(3)
+  decidedBy     String?       @map("decided_by")
+
+  requirementStatuses PublishedRequirementStatus[]
+  typeScores          PublishedTypeScore[]
+  subGroupScores      PublishedSubGroupScore[]
+  groupScores         PublishedGroupScore[]
+
+  @@index([status, decidedAt])
+  @@map("publish_run")
+}
+
+model PublishedRequirementStatus {
+  id                String    @id @default(uuid()) @db.Uuid
+  runId             String    @map("run_id") @db.Uuid
+  requirementId     String    @map("requirement_id") @db.Uuid
+  subjectId         String    @map("subject_id") @db.Uuid
+  complianceTypeId  String    @map("compliance_type_id") @db.Uuid
+  recordId          String?   @map("record_id") @db.Uuid
+  compliant         Boolean
+  /// DATE, NO_RECORD or NO_EXPIRY_DATE_SET.
+  dueDateKind       String    @map("due_date_kind")
+  dueDate           DateTime? @map("due_date") @db.Date
+  completionStatus  String?   @map("completion_status")
+  compliance        Int?
+  complianceCore    Int?      @map("compliance_core")
+  expiry            String?
+  weeksNonCompliant Int?      @map("weeks_non_compliant")
+
+  run PublishRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("published_requirement_status")
+}
+
+model PublishedTypeScore {
+  id                   String    @id @default(uuid()) @db.Uuid
+  runId                String    @map("run_id") @db.Uuid
+  hierarchy            Hierarchy
+  group                String
+  subGroup             String    @map("sub_group")
+  complianceType       String    @map("compliance_type")
+  percentCompliant     Float?    @map("percent_compliant")
+  percentCompliantCore Float?    @map("percent_compliant_core")
+  rag                  Float?
+  ragCore              Float?    @map("rag_core")
+
+  run PublishRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, hierarchy])
+  @@map("published_type_score")
+}
+
+model PublishedSubGroupScore {
+  id                   String    @id @default(uuid()) @db.Uuid
+  runId                String    @map("run_id") @db.Uuid
+  hierarchy            Hierarchy
+  group                String
+  subGroup             String    @map("sub_group")
+  percentCompliant     Float?    @map("percent_compliant")
+  percentCompliantCore Float?    @map("percent_compliant_core")
+  rag                  Float?
+  ragCore              Float?    @map("rag_core")
+
+  run PublishRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, hierarchy])
+  @@map("published_sub_group_score")
+}
+
+model PublishedGroupScore {
+  id                   String    @id @default(uuid()) @db.Uuid
+  runId                String    @map("run_id") @db.Uuid
+  hierarchy            Hierarchy
+  group                String
+  percentCompliant     Float?    @map("percent_compliant")
+  percentCompliantCore Float?    @map("percent_compliant_core")
+  rag                  Float?
+  ragCore              Float?    @map("rag_core")
+
+  run PublishRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, hierarchy])
+  @@map("published_group_score")
+}
