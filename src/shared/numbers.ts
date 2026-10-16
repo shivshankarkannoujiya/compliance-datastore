@@ -23,3 +23,8 @@ export function containsText(haystack: string, needle: string): boolean {
 export function normalise(text: string): string {
   return text.trim().toLowerCase();
 }
+
+/** Lower-cased, trimmed, single-spaced: "  Dr  Jane SMITH " → "dr jane smith". Used for unique name keys. */
+export function normaliseName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLowerCase();
+}
